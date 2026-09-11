@@ -13,7 +13,7 @@ db = firestore.client()
 
 app = Flask(__name__)
 
-SASPAY_SECRET_KEY = os.environ.get("sk_live_3Q86cSVC5r2YkLLtJnG5IcD5sjS9E5GVbSNDGe7303w")
+SASPAY_SECRET_KEY = os.environ.get("SASPAY_SECRET_KEY")
 SASPAY_BASE_URL = "https://api.saspay.me/api/v1"
 HEADERS = {
     "Authorization": f"Bearer {SASPAY_SECRET_KEY}",
