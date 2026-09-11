@@ -20,9 +20,11 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
+
 @app.route("/")
 def home():
     return "OK"
+
 
 # --- Créer une session de paiement ---
 @app.route("/creer-session", methods=["POST"])
@@ -44,39 +46,96 @@ def creer_session():
 
     if r.status_code in (200, 201):
         result = r.json().get("data", r.json())
-        # On mémorise à qui appartient cette session
+
+        # On mémorise à qui appartient cette session précise.
         db.collection("sessions").document(result["id"]).set({
             "user_id": user_id,
             "montant": montant,
+            "email": email,
+            "nom": nom,
             "statut": result.get("status", "PENDING"),
+            "transaction_id": result.get("transaction"),
+            "created_at": firestore.SERVER_TIMESTAMP,
         })
         return jsonify(result), 200
 
     return jsonify({"error": r.text}), r.status_code
 
-# --- Vérifier un paiement ---
-@app.route("/verifier/<transaction_id>", methods=["GET"])
-def verifier(transaction_id):
-    r = requests.get(f"{SASPAY_BASE_URL}/payments/{transaction_id}/verify/", headers=HEADERS)
+
+# --- Relire une session de checkout (utilisé par le suivi automatique Flutter) ---
+@app.route("/checkout-sessions/<session_id>/", methods=["GET"])
+def relire_session(session_id):
+    r = requests.get(f"{SASPAY_BASE_URL}/checkout-sessions/{session_id}/", headers=HEADERS)
 
     if r.status_code == 200:
         result = r.json().get("data", r.json())
-        statut = result.get("status")
 
-        if statut == "SUCCESS":
-            # Retrouver l'utilisateur lié à cette transaction
-            sessions = db.collection("sessions").where("statut", "==", "PENDING").stream()
-            for s in sessions:
-                doc = s.to_dict()
-                db.collection("paiements").document(doc["user_id"]).set({
-                    "montant": doc["montant"],
-                    "statut": "success",
-                }, merge=True)
-                db.collection("sessions").document(s.id).update({"statut": "SUCCESS"})
+        # On garde le statut et le transaction_id à jour sur NOTRE session,
+        # sans jamais toucher aux autres sessions en attente.
+        db.collection("sessions").document(session_id).set({
+            "statut": result.get("status"),
+            "transaction_id": result.get("transaction"),
+        }, merge=True)
 
         return jsonify(result), 200
 
     return jsonify({"error": r.text}), r.status_code
+
+
+# --- Vérifier un paiement précis ---
+@app.route("/verifier/<transaction_id>", methods=["GET"])
+def verifier(transaction_id):
+    r = requests.get(f"{SASPAY_BASE_URL}/payments/{transaction_id}/verify/", headers=HEADERS)
+
+    if r.status_code != 200:
+        return jsonify({"error": r.text}), r.status_code
+
+    result = r.json().get("data", r.json())
+    statut = result.get("status")
+
+    # On retrouve UNIQUEMENT la session liée à cette transaction précise
+    # (et non plus toutes les sessions PENDING de tout le monde).
+    sessions = (
+        db.collection("sessions")
+        .where("transaction_id", "==", transaction_id)
+        .limit(1)
+        .stream()
+    )
+    session_doc = next(sessions, None)
+
+    if session_doc is not None:
+        doc = session_doc.to_dict()
+        user_id = doc.get("user_id")
+        montant = doc.get("montant")
+
+        # Historique complet de la transaction, quel que soit le résultat
+        # (succès, échec, annulation...).
+        db.collection("transactions").document(transaction_id).set({
+            "user_id": user_id,
+            "montant": montant,
+            "statut": statut,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+
+        # Mise à jour de la session correspondante seulement.
+        db.collection("sessions").document(session_doc.id).update({"statut": statut})
+
+        if statut == "SUCCESS":
+            db.collection("paiements").document(user_id).set({
+                "montant": montant,
+                "statut": "success",
+                "dernier_transaction_id": transaction_id,
+            }, merge=True)
+        else:
+            # Paiement refusé, échoué ou annulé : on le trace aussi,
+            # au lieu de ne rien enregistrer.
+            db.collection("paiements").document(user_id).set({
+                "statut": statut.lower() if statut else "unknown",
+                "dernier_transaction_id": transaction_id,
+            }, merge=True)
+
+    return jsonify(result), 200
+
 
 # --- Webhook SasPay (si dispo) ---
 @app.route("/webhook/saspay", methods=["POST"])
@@ -86,13 +145,14 @@ def saspay_webhook():
     utilisateur = data.get("user_id")
     statut = data.get("status")
 
-    if statut == "success":
+    if utilisateur:
         db.collection("paiements").document(utilisateur).set({
             "montant": montant,
-            "statut": statut
+            "statut": statut,
         }, merge=True)
 
     return jsonify({"received": True}), 200
+
 
 if __name__ == "__main__":
     app.run()
