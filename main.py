@@ -1,32 +1,98 @@
+import json
 import os
 import requests
-from fastapi import FastAPI, HTTPException
+from flask import Flask, request, jsonify
+import firebase_admin
+from firebase_admin import credentials, firestore
 
-app = FastAPI()
+# Initialisation Firebase sécurisée via les variables d'environnement de Render
+firebase_config = json.loads(os.environ.get("FIREBASE_CONFIG_JSON"))
+cred = credentials.Certificate(firebase_config)
+firebase_admin.initialize_app(cred)
+db = firestore.client()
 
-# Récupération des identifiants stockés dans les variables d'environnement Render
-SASAPAY_CLIENT_ID = os.getenv("5ieAjfdagsSQT8OWz2RW3ZaTYEsiNgKklNP7V20f")
-SASAPAY_CLIENT_SECRET = os.getenv("BAPBdmuS6Ye9SpD7iSCgcYmtvEtMwyZRBYCmXix23G8lRA6uppkWSVDpY5JxqMAuthvpBiTEMh8jUhfJRuJGiiqsElm4LGpmYX0GaUkLwlMli1qJ3oYQxdATpBuK56Q7")
+app = Flask(__name__)
 
-# URL de l'authentification SasaPay (exemple pour la Sandbox / test)
-AUTH_URL = "https://sandbox.sasapay.app/oauth/v1/generate?grant_type=client_credentials"
+SASPAY_SECRET_KEY = os.environ.get("sk_live_3Q86cSVC5r2YkLLtJnG5IcD5sjS9E5GVbSNDGe7303w")
+SASPAY_BASE_URL = "https://api.saspay.me/api/v1"
+HEADERS = {
+    "Authorization": f"Bearer {SASPAY_SECRET_KEY}",
+    "Content-Type": "application/json",
+}
 
-@app.get("/")
-def read_root():
-    return {"message": "Cloud Function FastAPI avec SasaPay active !"}
+@app.route("/")
+def home():
+    return "OK"
 
-@app.get("/get-token")
-def get_sasapay_token():
-    if not SASAPAY_CLIENT_ID or not SASAPAY_CLIENT_SECRET:
-        raise HTTPException(status_code=500, detail="Les clés SasaPay ne sont pas configurées.")
-    
-    # Appel pour générer le jeton d'accès
-    response = requests.get(
-        AUTH_URL,
-        auth=(SASAPAY_CLIENT_ID, SASAPAY_CLIENT_SECRET)
-    )
-    
-    if response.status_code != 200:
-        raise HTTPException(status_code=response.status_code, detail="Échec de l'authentification auprès de SasaPay")
-        
-    return response.json()
+# --- Créer une session de paiement ---
+@app.route("/creer-session", methods=["POST"])
+def creer_session():
+    data = request.json
+    montant = data.get("amount")
+    email = data.get("email")
+    nom = data.get("name")
+    user_id = data.get("user_id")
+
+    payload = {
+        "amount": f"{montant:.2f}",
+        "currency": "XOF",
+        "description": "Recharge du solde publicitaire",
+        "customer_email": email,
+        "customer_name": nom,
+    }
+    r = requests.post(f"{SASPAY_BASE_URL}/checkout-sessions/", json=payload, headers=HEADERS)
+
+    if r.status_code in (200, 201):
+        result = r.json().get("data", r.json())
+        # On mémorise à qui appartient cette session
+        db.collection("sessions").document(result["id"]).set({
+            "user_id": user_id,
+            "montant": montant,
+            "statut": result.get("status", "PENDING"),
+        })
+        return jsonify(result), 200
+
+    return jsonify({"error": r.text}), r.status_code
+
+# --- Vérifier un paiement ---
+@app.route("/verifier/<transaction_id>", methods=["GET"])
+def verifier(transaction_id):
+    r = requests.get(f"{SASPAY_BASE_URL}/payments/{transaction_id}/verify/", headers=HEADERS)
+
+    if r.status_code == 200:
+        result = r.json().get("data", r.json())
+        statut = result.get("status")
+
+        if statut == "SUCCESS":
+            # Retrouver l'utilisateur lié à cette transaction
+            sessions = db.collection("sessions").where("statut", "==", "PENDING").stream()
+            for s in sessions:
+                doc = s.to_dict()
+                db.collection("paiements").document(doc["user_id"]).set({
+                    "montant": doc["montant"],
+                    "statut": "success",
+                }, merge=True)
+                db.collection("sessions").document(s.id).update({"statut": "SUCCESS"})
+
+        return jsonify(result), 200
+
+    return jsonify({"error": r.text}), r.status_code
+
+# --- Webhook SasPay (si dispo) ---
+@app.route("/webhook/saspay", methods=["POST"])
+def saspay_webhook():
+    data = request.json
+    montant = data.get("amount")
+    utilisateur = data.get("user_id")
+    statut = data.get("status")
+
+    if statut == "success":
+        db.collection("paiements").document(utilisateur).set({
+            "montant": montant,
+            "statut": statut
+        }, merge=True)
+
+    return jsonify({"received": True}), 200
+
+if __name__ == "__main__":
+    app.run()
