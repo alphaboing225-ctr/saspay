@@ -47,7 +47,6 @@ def creer_session():
     if r.status_code in (200, 201):
         result = r.json().get("data", r.json())
 
-        # On mémorise à qui appartient cette session précise.
         db.collection("sessions").document(result["id"]).set({
             "user_id": user_id,
             "montant": montant,
@@ -70,8 +69,6 @@ def relire_session(session_id):
     if r.status_code == 200:
         result = r.json().get("data", r.json())
 
-        # On garde le statut et le transaction_id à jour sur NOTRE session,
-        # sans jamais toucher aux autres sessions en attente.
         db.collection("sessions").document(session_id).set({
             "statut": result.get("status"),
             "transaction_id": result.get("transaction"),
@@ -80,6 +77,45 @@ def relire_session(session_id):
         return jsonify(result), 200
 
     return jsonify({"error": r.text}), r.status_code
+
+
+def _crediter_si_pas_deja_fait(transaction_id, user_id, montant, devise, statut):
+    """
+    Crédite le solde de l'utilisateur UNE SEULE FOIS pour cette transaction,
+    même si cette fonction est appelée plusieurs fois (double clic sur
+    "Vérifier", minuteur qui repasse dessus, appli relancée, etc.).
+
+    On utilise une transaction Firestore : le document
+    recharges/{transaction_id} sert de verrou. S'il existe déjà, on ne fait
+    rien de plus.
+    """
+    recharge_ref = db.collection("recharges").document(transaction_id)
+
+    @firestore.transactional
+    def _run(transaction):
+        snapshot = recharge_ref.get(transaction=transaction)
+        if snapshot.exists:
+            # Déjà traité précédemment : on ne recrédite rien.
+            return False
+
+        transaction.set(recharge_ref, {
+            "uid": user_id,
+            "montant": montant,
+            "devise": devise,
+            "statut": statut,
+            "transactionId": transaction_id,
+            "createdAt": firestore.SERVER_TIMESTAMP,
+        })
+
+        if statut == "SUCCESS":
+            user_ref = db.collection("users").document(user_id)
+            transaction.set(user_ref, {
+                "pub_solde": firestore.Increment(montant),
+            }, merge=True)
+
+        return True
+
+    return _run(db.transaction())
 
 
 # --- Vérifier un paiement précis ---
@@ -92,9 +128,9 @@ def verifier(transaction_id):
 
     result = r.json().get("data", r.json())
     statut = result.get("status")
+    montant_net = result.get("net_amount")
+    devise = result.get("currency", "XOF")
 
-    # On retrouve UNIQUEMENT la session liée à cette transaction précise
-    # (et non plus toutes les sessions PENDING de tout le monde).
     sessions = (
         db.collection("sessions")
         .where("transaction_id", "==", transaction_id)
@@ -106,10 +142,10 @@ def verifier(transaction_id):
     if session_doc is not None:
         doc = session_doc.to_dict()
         user_id = doc.get("user_id")
-        montant = doc.get("montant")
+        montant = float(montant_net) if montant_net is not None else doc.get("montant")
 
-        # Historique complet de la transaction, quel que soit le résultat
-        # (succès, échec, annulation...).
+        db.collection("sessions").document(session_doc.id).update({"statut": statut})
+
         db.collection("transactions").document(transaction_id).set({
             "user_id": user_id,
             "montant": montant,
@@ -117,22 +153,14 @@ def verifier(transaction_id):
             "updated_at": firestore.SERVER_TIMESTAMP,
         }, merge=True)
 
-        # Mise à jour de la session correspondante seulement.
-        db.collection("sessions").document(session_doc.id).update({"statut": statut})
+        # Crédit du solde (une seule fois, quel que soit le nombre d'appels).
+        _crediter_si_pas_deja_fait(transaction_id, user_id, montant, devise, statut)
 
-        if statut == "SUCCESS":
-            db.collection("paiements").document(user_id).set({
-                "montant": montant,
-                "statut": "success",
-                "dernier_transaction_id": transaction_id,
-            }, merge=True)
-        else:
-            # Paiement refusé, échoué ou annulé : on le trace aussi,
-            # au lieu de ne rien enregistrer.
-            db.collection("paiements").document(user_id).set({
-                "statut": statut.lower() if statut else "unknown",
-                "dernier_transaction_id": transaction_id,
-            }, merge=True)
+        db.collection("paiements").document(user_id).set({
+            "montant": montant if statut == "SUCCESS" else None,
+            "statut": statut.lower() if statut else "unknown",
+            "dernier_transaction_id": transaction_id,
+        }, merge=True)
 
     return jsonify(result), 200
 
@@ -144,12 +172,13 @@ def saspay_webhook():
     montant = data.get("amount")
     utilisateur = data.get("user_id")
     statut = data.get("status")
+    transaction_id = data.get("transaction_id") or data.get("id")
 
-    if utilisateur:
-        db.collection("paiements").document(utilisateur).set({
-            "montant": montant,
-            "statut": statut,
-        }, merge=True)
+    if utilisateur and transaction_id:
+        _crediter_si_pas_deja_fait(
+            transaction_id, utilisateur, float(montant) if montant else 0,
+            data.get("currency", "XOF"), statut.upper() if statut else "UNKNOWN",
+        )
 
     return jsonify({"received": True}), 200
 
