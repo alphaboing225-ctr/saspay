@@ -1,15 +1,28 @@
 import json
 import os
+from datetime import datetime, timedelta, timezone
+
 import requests
 from flask import Flask, request, jsonify
 import firebase_admin
 from firebase_admin import credentials, firestore
+import cloudinary
+import cloudinary.uploader
 
 # Initialisation Firebase sécurisée via les variables d'environnement de Render
 firebase_config = json.loads(os.environ.get("FIREBASE_CONFIG_JSON"))
 cred = credentials.Certificate(firebase_config)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
+
+# Cloudinary — nécessaire pour supprimer les images des pubs expirées.
+# Ajoutez CLOUDINARY_API_KEY et CLOUDINARY_API_SECRET dans les variables
+# d'environnement Render (visibles dans votre tableau de bord Cloudinary).
+cloudinary.config(
+    cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME", "csgiimmi"),
+    api_key=os.environ.get("CLOUDINARY_API_KEY"),
+    api_secret=os.environ.get("CLOUDINARY_API_SECRET"),
+)
 
 app = Flask(__name__)
 
@@ -26,7 +39,10 @@ def home():
     return "OK"
 
 
-# --- Créer une session de paiement ---
+# ====================================================================
+# 💳 RECHARGE (SasPay)
+# ====================================================================
+
 @app.route("/creer-session", methods=["POST"])
 def creer_session():
     data = request.json
@@ -61,7 +77,6 @@ def creer_session():
     return jsonify({"error": r.text}), r.status_code
 
 
-# --- Relire une session de checkout (utilisé par le suivi automatique Flutter) ---
 @app.route("/checkout-sessions/<session_id>/", methods=["GET"])
 def relire_session(session_id):
     r = requests.get(f"{SASPAY_BASE_URL}/checkout-sessions/{session_id}/", headers=HEADERS)
@@ -80,22 +95,13 @@ def relire_session(session_id):
 
 
 def _crediter_si_pas_deja_fait(transaction_id, user_id, montant, devise, statut):
-    """
-    Crédite le solde de l'utilisateur UNE SEULE FOIS pour cette transaction,
-    même si cette fonction est appelée plusieurs fois (double clic sur
-    "Vérifier", minuteur qui repasse dessus, appli relancée, etc.).
-
-    On utilise une transaction Firestore : le document
-    recharges/{transaction_id} sert de verrou. S'il existe déjà, on ne fait
-    rien de plus.
-    """
+    """Crédite le solde UNE SEULE FOIS par transaction (idempotent)."""
     recharge_ref = db.collection("recharges").document(transaction_id)
 
     @firestore.transactional
     def _run(transaction):
         snapshot = recharge_ref.get(transaction=transaction)
         if snapshot.exists:
-            # Déjà traité précédemment : on ne recrédite rien.
             return False
 
         transaction.set(recharge_ref, {
@@ -118,7 +124,6 @@ def _crediter_si_pas_deja_fait(transaction_id, user_id, montant, devise, statut)
     return _run(db.transaction())
 
 
-# --- Vérifier un paiement précis ---
 @app.route("/verifier/<transaction_id>", methods=["GET"])
 def verifier(transaction_id):
     r = requests.get(f"{SASPAY_BASE_URL}/payments/{transaction_id}/verify/", headers=HEADERS)
@@ -153,7 +158,6 @@ def verifier(transaction_id):
             "updated_at": firestore.SERVER_TIMESTAMP,
         }, merge=True)
 
-        # Crédit du solde (une seule fois, quel que soit le nombre d'appels).
         _crediter_si_pas_deja_fait(transaction_id, user_id, montant, devise, statut)
 
         db.collection("paiements").document(user_id).set({
@@ -165,7 +169,6 @@ def verifier(transaction_id):
     return jsonify(result), 200
 
 
-# --- Webhook SasPay (si dispo) ---
 @app.route("/webhook/saspay", methods=["POST"])
 def saspay_webhook():
     data = request.json
@@ -181,6 +184,172 @@ def saspay_webhook():
         )
 
     return jsonify({"received": True}), 200
+
+
+# ====================================================================
+# 📢 PUBS PAYANTES — création, renouvellement, expiration
+# ====================================================================
+
+@app.route("/creer-pub", methods=["POST"])
+def creer_pub():
+    data = request.json
+    user_id = data.get("user_id")
+    prix = data.get("prix")
+    duree_jours = data.get("duree_jours")
+    images = data.get("images", [])  # [{"url": "...", "publicId": "..."}]
+    lien_redirection = data.get("lien_redirection")
+
+    if not user_id or prix is None or duree_jours is None:
+        return jsonify({"error": "parametres_manquants"}), 400
+
+    user_ref = db.collection("users").document(user_id)
+    pub_ref = db.collection("pubs").document()
+
+    @firestore.transactional
+    def _run(transaction):
+        snapshot = user_ref.get(transaction=transaction)
+        solde_actuel = 0
+        if snapshot.exists:
+            solde_actuel = (snapshot.to_dict() or {}).get("pub_solde", 0) or 0
+
+        if solde_actuel < prix:
+            return {"ok": False, "solde_actuel": solde_actuel}
+
+        transaction.update(user_ref, {"pub_solde": firestore.Increment(-prix)})
+
+        maintenant = datetime.now(timezone.utc)
+        date_fin = maintenant + timedelta(days=duree_jours)
+
+        transaction.set(pub_ref, {
+            "uid": user_id,
+            "images": images,
+            "lienRedirection": lien_redirection,
+            "statut": "active",
+            "prixPaye": prix,
+            "dureeJours": duree_jours,
+            "dateDebut": maintenant,
+            "dateFin": date_fin,
+            "createdAt": firestore.SERVER_TIMESTAMP,
+        })
+        return {"ok": True}
+
+    resultat = _run(db.transaction())
+
+    if not resultat["ok"]:
+        return jsonify({
+            "error": "solde_insuffisant",
+            "solde_actuel": resultat["solde_actuel"],
+        }), 402
+
+    return jsonify({"success": True, "pub_id": pub_ref.id}), 200
+
+
+@app.route("/renouveler-pub", methods=["POST"])
+def renouveler_pub():
+    data = request.json
+    user_id = data.get("user_id")
+    pub_id = data.get("pub_id")
+    prix = data.get("prix")
+    duree_jours = data.get("duree_jours")
+
+    if not user_id or not pub_id or prix is None or duree_jours is None:
+        return jsonify({"error": "parametres_manquants"}), 400
+
+    user_ref = db.collection("users").document(user_id)
+    pub_ref = db.collection("pubs").document(pub_id)
+
+    @firestore.transactional
+    def _run(transaction):
+        user_snap = user_ref.get(transaction=transaction)
+        pub_snap = pub_ref.get(transaction=transaction)
+
+        if not pub_snap.exists or pub_snap.to_dict().get("uid") != user_id:
+            return {"ok": False, "raison": "pub_introuvable"}
+
+        solde_actuel = (user_snap.to_dict() or {}).get("pub_solde", 0) or 0
+        if solde_actuel < prix:
+            return {"ok": False, "raison": "solde_insuffisant", "solde_actuel": solde_actuel}
+
+        transaction.update(user_ref, {"pub_solde": firestore.Increment(-prix)})
+
+        maintenant = datetime.now(timezone.utc)
+        date_fin = maintenant + timedelta(days=duree_jours)
+
+        transaction.update(pub_ref, {
+            "statut": "active",
+            "prixPaye": prix,
+            "dureeJours": duree_jours,
+            "dateDebut": maintenant,
+            "dateFin": date_fin,
+            "dateLimiteRenouvellement": firestore.DELETE_FIELD,
+        })
+        return {"ok": True}
+
+    resultat = _run(db.transaction())
+
+    if not resultat["ok"]:
+        code = 402 if resultat.get("raison") == "solde_insuffisant" else 404
+        return jsonify(resultat), code
+
+    return jsonify({"success": True}), 200
+
+
+def _supprimer_image_cloudinary(public_id):
+    try:
+        cloudinary.uploader.destroy(public_id)
+    except Exception as e:
+        print(f"Erreur suppression Cloudinary ({public_id}) : {e}")
+
+
+@app.route("/verifier-pubs", methods=["GET", "POST"])
+def verifier_pubs():
+    """
+    À appeler périodiquement (ex. Render Cron Job une fois par jour, ou à
+    défaut manuellement / à l'ouverture de l'appli) :
+      1. Les pubs actives dont dateFin est dépassée passent en
+         "en_attente_renouvellement" avec 7 jours de délai.
+      2. Les pubs en attente de renouvellement dont le délai de 7 jours
+         est dépassé sont supprimées définitivement (Firestore + images
+         Cloudinary).
+    """
+    maintenant = datetime.now(timezone.utc)
+
+    pubs_expirees = (
+        db.collection("pubs")
+        .where("statut", "==", "active")
+        .where("dateFin", "<=", maintenant)
+        .stream()
+    )
+    nb_passees_en_attente = 0
+    for doc in pubs_expirees:
+        date_limite = maintenant + timedelta(days=7)
+        doc.reference.update({
+            "statut": "en_attente_renouvellement",
+            "dateLimiteRenouvellement": date_limite,
+        })
+        nb_passees_en_attente += 1
+
+    pubs_a_supprimer = (
+        db.collection("pubs")
+        .where("statut", "==", "en_attente_renouvellement")
+        .where("dateLimiteRenouvellement", "<=", maintenant)
+        .stream()
+    )
+    nb_supprimees = 0
+    for doc in pubs_a_supprimer:
+        data = doc.to_dict()
+        for image in data.get("images", []):
+            public_id = image.get("publicId") if isinstance(image, dict) else None
+            if public_id:
+                _supprimer_image_cloudinary(public_id)
+        doc.reference.delete()
+        nb_supprimees += 1
+
+    return jsonify({
+        "verifie_le": maintenant.isoformat(),
+        "passees_en_attente": nb_passees_en_attente,
+        "supprimees": nb_supprimees,
+    }), 200
 
 
 if __name__ == "__main__":
