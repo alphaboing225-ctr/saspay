@@ -198,6 +198,7 @@ def creer_pub():
     duree_jours = data.get("duree_jours")
     images = data.get("images", [])  # [{"url": "...", "publicId": "..."}]
     lien_redirection = data.get("lien_redirection")
+    produit_slug = data.get("produit_slug")  # 🆕 slug du produit lié (facultatif)
 
     if not user_id or prix is None or duree_jours is None:
         return jsonify({"error": "parametres_manquants"}), 400
@@ -224,6 +225,7 @@ def creer_pub():
             "uid": user_id,
             "images": images,
             "lienRedirection": lien_redirection,
+            "produitSlug": produit_slug,  # 🆕 enregistré sous ce nom, lu par pub_views.dart
             "statut": "active",
             "prixPaye": prix,
             "dureeJours": duree_jours,
