@@ -198,7 +198,6 @@ def creer_pub():
     duree_jours = data.get("duree_jours")
     images = data.get("images", [])  # [{"url": "...", "publicId": "..."}]
     lien_redirection = data.get("lien_redirection")
-    produit_slug = data.get("produit_slug")  # 🆕 slug du produit lié (facultatif)
 
     if not user_id or prix is None or duree_jours is None:
         return jsonify({"error": "parametres_manquants"}), 400
@@ -225,7 +224,6 @@ def creer_pub():
             "uid": user_id,
             "images": images,
             "lienRedirection": lien_redirection,
-            "produitSlug": produit_slug,  # 🆕 enregistré sous ce nom, lu par pub_views.dart
             "statut": "active",
             "prixPaye": prix,
             "dureeJours": duree_jours,
@@ -301,6 +299,56 @@ def _supprimer_image_cloudinary(public_id):
         cloudinary.uploader.destroy(public_id)
     except Exception as e:
         print(f"Erreur suppression Cloudinary ({public_id}) : {e}")
+
+
+COLLECTIONS_MEDIA_AUTORISEES = {"posts", "stories"}
+
+
+@app.route("/supprimer-video", methods=["POST"])
+def supprimer_video():
+    """
+    Supprime une publication (post ou story) à la fois de Firestore et de
+    Cloudinary. Le public_id Cloudinary ne doit JAMAIS être supprimé
+    depuis Flutter directement (ça exigerait d'exposer la clé secrète
+    Cloudinary dans l'appli) : cette route vérifie d'abord que le
+    demandeur est bien le propriétaire, puis fait la suppression des
+    deux côtés.
+    """
+    data = request.json
+    video_id = data.get("video_id")
+    user_id = data.get("user_id")
+    collection_name = data.get("collection_name", "posts")
+
+    if not video_id or not user_id:
+        return jsonify({"error": "parametres_manquants"}), 400
+
+    if collection_name not in COLLECTIONS_MEDIA_AUTORISEES:
+        return jsonify({"error": "collection_invalide"}), 400
+
+    video_ref = db.collection(collection_name).document(video_id)
+    video_snap = video_ref.get()
+
+    if not video_snap.exists:
+        return jsonify({"error": "video_introuvable"}), 404
+
+    video_data = video_snap.to_dict()
+    if video_data.get("uid") != user_id:
+        return jsonify({"error": "non_autorise"}), 403
+
+    public_id = video_data.get("publicId")
+    is_video = bool(video_data.get("isVideo"))
+    if public_id:
+        try:
+            cloudinary.uploader.destroy(
+                public_id,
+                resource_type="video" if is_video else "image",
+            )
+        except Exception as e:
+            print(f"Erreur suppression Cloudinary ({public_id}) : {e}")
+
+    video_ref.delete()
+
+    return jsonify({"success": True}), 200
 
 
 @app.route("/verifier-pubs", methods=["GET", "POST"])
